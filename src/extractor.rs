@@ -1,6 +1,6 @@
 use crate::models::{MediaItem, MediaType, PostInfo};
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, REFERER, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT};
 use serde_json::Value;
 
 pub struct Extractor {
@@ -18,7 +18,7 @@ impl Extractor {
 
     pub fn extract_shortcode(input: &str) -> Result<String, String> {
         let trimmed = input.trim();
-        let pattern = Regex::new(r"(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)").unwrap();
+        let pattern = Regex::new(r"(?:https?://)?(?:www\.)?instagram\.com/(?:[a-zA-Z0-9_.-]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)").unwrap();
         if let Some(captures) = pattern.captures(trimmed) {
             if let Some(matched) = captures.get(1) {
                 return Ok(matched.as_str().to_string());
@@ -36,13 +36,26 @@ impl Extractor {
     pub async fn fetch_post(&self, url_or_shortcode: &str, cookie: Option<&str>) -> Result<PostInfo, String> {
         let shortcode = Self::extract_shortcode(url_or_shortcode)?;
 
-        if let Ok(info) = self.fetch_via_graphql(&shortcode, "8845758582119845", cookie).await {
+        if cookie.is_some() {
+            if let Ok(info) = self.fetch_via_graphql(&shortcode, "8845758582119845", cookie).await {
+                if !info.items.is_empty() {
+                    return Ok(info);
+                }
+            }
+            if let Ok(info) = self.fetch_via_graphql(&shortcode, "10015901848480474", cookie).await {
+                if !info.items.is_empty() {
+                    return Ok(info);
+                }
+            }
+        }
+
+        if let Ok(info) = self.fetch_via_crawler(&shortcode, cookie).await {
             if !info.items.is_empty() {
                 return Ok(info);
             }
         }
 
-        if let Ok(info) = self.fetch_via_graphql(&shortcode, "10015901848480474", cookie).await {
+        if let Ok(info) = self.fetch_via_graphql(&shortcode, "8845758582119845", cookie).await {
             if !info.items.is_empty() {
                 return Ok(info);
             }
@@ -63,6 +76,135 @@ impl Extractor {
         Err("Failed to extract media. The post may be private, deleted, or blocked by Instagram.".to_string())
     }
 
+    async fn fetch_via_crawler(&self, shortcode: &str, cookie: Option<&str>) -> Result<PostInfo, String> {
+        let post_url = format!("https://www.instagram.com/p/{}/", shortcode);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static("facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"),
+        );
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        );
+
+        if let Some(cookie_val) = cookie {
+            if let Ok(val) = HeaderValue::from_str(cookie_val) {
+                headers.insert(COOKIE, val);
+            }
+        }
+
+        let response = self
+            .client
+            .get(&post_url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            return Err(format!("Crawler request failed: {}", response.status()));
+        }
+
+        let html = response.text().await.map_err(|e| e.to_string())?;
+
+        let video_re = Regex::new(r#"<meta\s+(?:property|name)=["']og:video(?:|:secure_url)["']\s+content=["']([^"']+)["']"#).unwrap();
+        let video_re_rev = Regex::new(r#"<meta\s+content=["']([^"']+)["']\s+(?:property|name)=["']og:video(?:|:secure_url)["']"#).unwrap();
+
+        let image_re = Regex::new(r#"<meta\s+(?:property|name)=["']og:image["']\s+content=["']([^"']+)["']"#).unwrap();
+        let image_re_rev = Regex::new(r#"<meta\s+content=["']([^"']+)["']\s+(?:property|name)=["']og:image["']"#).unwrap();
+
+        let desc_re = Regex::new(r#"<meta\s+(?:property|name)=["'](?:og:description|description)["']\s+content=["']([^"']+)["']"#).unwrap();
+        let desc_re_rev = Regex::new(r#"<meta\s+content=["']([^"']+)["']\s+(?:property|name)=["'](?:og:description|description)["']"#).unwrap();
+
+        let title_re = Regex::new(r#"<meta\s+(?:property|name)=["']og:title["']\s+content=["']([^"']+)["']"#).unwrap();
+        let title_re_rev = Regex::new(r#"<meta\s+content=["']([^"']+)["']\s+(?:property|name)=["']og:title["']"#).unwrap();
+
+        let video_url = video_re
+            .captures(&html)
+            .or_else(|| video_re_rev.captures(&html))
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().replace("&amp;", "&"));
+
+        let image_url = image_re
+            .captures(&html)
+            .or_else(|| image_re_rev.captures(&html))
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().replace("&amp;", "&"));
+
+        let title_raw = title_re
+            .captures(&html)
+            .or_else(|| title_re_rev.captures(&html))
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().replace("&amp;", "&"));
+
+        let desc_raw = desc_re
+            .captures(&html)
+            .or_else(|| desc_re_rev.captures(&html))
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().replace("&amp;", "&"));
+
+        let mut items = Vec::new();
+
+        if let Some(v_url) = video_url {
+            let thumb = image_url.clone().unwrap_or_else(|| v_url.clone());
+            items.push(MediaItem {
+                id: format!("{}_video", shortcode),
+                media_type: MediaType::Video,
+                url: v_url,
+                thumbnail_url: thumb,
+                width: None,
+                height: None,
+            });
+        } else if let Some(i_url) = image_url.clone() {
+            items.push(MediaItem {
+                id: format!("{}_image", shortcode),
+                media_type: MediaType::Image,
+                url: i_url.clone(),
+                thumbnail_url: i_url,
+                width: None,
+                height: None,
+            });
+        }
+
+        if items.is_empty() {
+            return Err("No OpenGraph media tags found in response".to_string());
+        }
+
+        let owner_username = title_raw.as_deref().and_then(|t| {
+            let user_re = Regex::new(r#"@([a-zA-Z0-9_.]+)"#).unwrap();
+            user_re.captures(t).and_then(|c| c.get(1)).map(|m| m.as_str().to_string())
+        });
+
+        let caption = desc_raw.map(|d| {
+            let quote_re = Regex::new(r#":\s*"([^"]+)""#).unwrap();
+            let raw_text = if let Some(cap) = quote_re.captures(&d) {
+                if let Some(m) = cap.get(1) {
+                    m.as_str().to_string()
+                } else {
+                    d
+                }
+            } else {
+                d
+            };
+            raw_text
+                .replace("&quot;", "\"")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&#064;", "@")
+                .replace("&#x27;", "'")
+        });
+
+        Ok(PostInfo {
+            shortcode: shortcode.to_string(),
+            caption,
+            owner_username,
+            owner_full_name: None,
+            items,
+        })
+    }
+
     async fn fetch_via_graphql(&self, shortcode: &str, doc_id: &str, cookie: Option<&str>) -> Result<PostInfo, String> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -75,6 +217,11 @@ impl Extractor {
             "X-IG-App-ID",
             HeaderValue::from_static("936619743392459"),
         );
+        headers.insert(
+            "X-ASBD-ID",
+            HeaderValue::from_static("359341"),
+        );
+        headers.insert(ORIGIN, HeaderValue::from_static("https://www.instagram.com"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
         headers.insert(REFERER, HeaderValue::from_static("https://www.instagram.com/"));
         headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
