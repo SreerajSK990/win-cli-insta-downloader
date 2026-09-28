@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Insta Media Downloader</title>
+    <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+    <header class="app-header">
+        <div class="brand">
+            <span class="brand-title">Insta Downloader</span>
+            <span class="brand-subtitle">High-speed media extraction</span>
+        </div>
+        <div class="header-meta">
+            <span class="storage-path" id="storagePath">Saving to: Downloads</span>
+            <button class="ghost-btn" id="toggleCookieBtn" type="button">Session Cookie</button>
+        </div>
+    </header>
+
+    <main class="app-main">
+        <section class="search-panel">
+            <div class="input-wrapper">
+                <input 
+                    type="text" 
+                    id="urlInput" 
+                    placeholder="Paste Instagram post, reel, or carousel link here..." 
+                    autocomplete="off" 
+                    spellcheck="false"
+                >
+                <button class="primary-btn" id="fetchBtn" type="button">Fetch Media</button>
+            </div>
+            
+            <div class="cookie-drawer hidden" id="cookieDrawer">
+                <input 
+                    type="password" 
+                    id="cookieInput" 
+                    placeholder="Optional: Paste Instagram sessionid cookie for login-walled or restricted posts" 
+                    autocomplete="off"
+                >
+            </div>
+
+            <div class="status-banner hidden" id="statusBanner">
+                <span id="statusText">Ready</span>
+            </div>
+        </section>
+
+        <section class="results-panel hidden" id="resultsPanel">
+            <div class="results-header">
+                <div class="author-info">
+                    <span class="post-owner" id="postOwner"></span>
+                    <span class="post-shortcode" id="postShortcode"></span>
+                    <p class="post-caption" id="postCaption"></p>
+                </div>
+                <div class="bulk-actions">
+                    <span class="count-badge" id="countBadge">0 items</span>
+                    <button class="secondary-btn" id="selectAllBtn" type="button">Select All</button>
+                    <button class="secondary-btn" id="deselectAllBtn" type="button">Deselect All</button>
+                    <button class="action-btn" id="downloadSelectedBtn" type="button">Download Selected</button>
+                    <button class="primary-btn" id="downloadAllBtn" type="button">Download All</button>
+                </div>
+            </div>
+
+            <div class="media-grid" id="mediaGrid"></div>
+        </section>
+    </main>
+
+    <script src="/assets/app.js"></script>
+</body>
+</html>
