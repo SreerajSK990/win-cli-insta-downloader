@@ -10,7 +10,7 @@ pub struct Extractor {
 impl Extractor {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { client }
@@ -36,6 +36,12 @@ impl Extractor {
     pub async fn fetch_post(&self, url_or_shortcode: &str, cookie: Option<&str>) -> Result<PostInfo, String> {
         let shortcode = Self::extract_shortcode(url_or_shortcode)?;
 
+        if let Ok(info) = self.fetch_via_desktop_page(url_or_shortcode, &shortcode, cookie).await {
+            if !info.items.is_empty() {
+                return Ok(info);
+            }
+        }
+
         if cookie.is_some() {
             if let Ok(info) = self.fetch_via_graphql(&shortcode, "8845758582119845", cookie).await {
                 if !info.items.is_empty() {
@@ -46,12 +52,6 @@ impl Extractor {
                 if !info.items.is_empty() {
                     return Ok(info);
                 }
-            }
-        }
-
-        if let Ok(info) = self.fetch_via_crawler(&shortcode, cookie).await {
-            if !info.items.is_empty() {
-                return Ok(info);
             }
         }
 
@@ -73,7 +73,412 @@ impl Extractor {
             }
         }
 
+        if let Ok(info) = self.fetch_via_crawler(&shortcode, cookie).await {
+            if !info.items.is_empty() {
+                return Ok(info);
+            }
+        }
+
         Err("Failed to extract media. The post may be private, deleted, or blocked by Instagram.".to_string())
+    }
+
+    async fn fetch_via_desktop_page(&self, original_input: &str, shortcode: &str, cookie: Option<&str>) -> Result<PostInfo, String> {
+        let direct_url = if original_input.starts_with("http://") || original_input.starts_with("https://") {
+            original_input.to_string()
+        } else {
+            format!("https://www.instagram.com/p/{}/", shortcode)
+        };
+
+        if let Ok(post) = self.fetch_and_parse_html(&direct_url, shortcode, cookie).await {
+            if !post.items.is_empty() {
+                return Ok(post);
+            }
+        }
+
+        let canonical_url = format!("https://www.instagram.com/p/{}/", shortcode);
+        if direct_url != canonical_url {
+            if let Ok(post) = self.fetch_and_parse_html(&canonical_url, shortcode, cookie).await {
+                if !post.items.is_empty() {
+                    return Ok(post);
+                }
+            }
+        }
+
+        Err("Failed to extract media from desktop page".to_string())
+    }
+
+    async fn fetch_and_parse_html(&self, url: &str, shortcode: &str, cookie: Option<&str>) -> Result<PostInfo, String> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"),
+        );
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("sec-fetch-dest"),
+            HeaderValue::from_static("document"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("sec-fetch-mode"),
+            HeaderValue::from_static("navigate"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("none"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("sec-fetch-user"),
+            HeaderValue::from_static("?1"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("upgrade-insecure-requests"),
+            HeaderValue::from_static("1"),
+        );
+
+        if let Some(cookie_val) = cookie {
+            if let Ok(val) = HeaderValue::from_str(cookie_val) {
+                headers.insert(COOKIE, val);
+            }
+        }
+
+        let response = self
+            .client
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            return Err(format!("Page request failed with status {}", response.status()));
+        }
+
+        let html = response.text().await.map_err(|e| e.to_string())?;
+        self.parse_desktop_html(&html, shortcode)
+    }
+
+    pub fn parse_desktop_html(&self, html: &str, shortcode: &str) -> Result<PostInfo, String> {
+        let script_re = Regex::new(r"(?s)<script[^>]*>(.*?)</script>").map_err(|e| e.to_string())?;
+
+        for cap in script_re.captures_iter(html) {
+            let content = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+            if content.is_empty() {
+                continue;
+            }
+
+            let clean_json = if let Some(stripped) = content.strip_prefix("for (;;);") {
+                stripped.trim()
+            } else {
+                content
+            };
+
+            if clean_json.contains("xig_polaris_media") {
+                let parsed_val = serde_json::from_str::<Value>(clean_json).ok().or_else(|| {
+                    let start = clean_json.find('{')?;
+                    let end = clean_json.rfind('}')?;
+                    if start < end {
+                        serde_json::from_str::<Value>(&clean_json[start..=end]).ok()
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(val) = parsed_val {
+                    if let Ok(post) = self.parse_polaris_json(&val, shortcode) {
+                        if !post.items.is_empty() {
+                            return Ok(post);
+                        }
+                    }
+                }
+            }
+
+            if clean_json.contains("xdt_shortcode_media") || clean_json.contains("shortcode_media") {
+                let parsed_val = serde_json::from_str::<Value>(clean_json).ok().or_else(|| {
+                    let start = clean_json.find('{')?;
+                    let end = clean_json.rfind('}')?;
+                    if start < end {
+                        serde_json::from_str::<Value>(&clean_json[start..=end]).ok()
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(val) = parsed_val {
+                    if let Ok(post) = self.parse_graphql_json(&val, shortcode) {
+                        if !post.items.is_empty() {
+                            return Ok(post);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(post) = self.parse_regex_candidates(html, shortcode) {
+            if !post.items.is_empty() {
+                return Ok(post);
+            }
+        }
+
+        Err("No media found in desktop page".to_string())
+    }
+
+    fn parse_polaris_json(&self, root: &Value, fallback_shortcode: &str) -> Result<PostInfo, String> {
+        let media = Self::find_key_recursive(root, "xig_polaris_media")
+            .ok_or_else(|| "No xig_polaris_media found".to_string())?;
+
+        let target = media.get("if_not_gated_logged_out").unwrap_or(media);
+
+        let shortcode = target
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback_shortcode)
+            .to_string();
+
+        let caption = target
+            .pointer("/caption/text")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let owner_username = target
+            .pointer("/user/username")
+            .or_else(|| target.pointer("/owner/username"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let owner_full_name = target
+            .pointer("/user/full_name")
+            .or_else(|| target.pointer("/owner/full_name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let mut items = Vec::new();
+
+        if let Some(children) = target.get("carousel_media").and_then(|v| v.as_array()) {
+            for (index, child) in children.iter().enumerate() {
+                if let Some(item) = self.parse_polaris_node(child, &shortcode, index + 1) {
+                    items.push(item);
+                }
+            }
+        }
+
+        if items.is_empty() {
+            if let Some(item) = self.parse_polaris_node(target, &shortcode, 1) {
+                items.push(item);
+            }
+        }
+
+        if items.is_empty() {
+            return Err("No downloadable items found in polaris media".to_string());
+        }
+
+        Ok(PostInfo {
+            shortcode,
+            caption,
+            owner_username,
+            owner_full_name,
+            items,
+        })
+    }
+
+    fn parse_polaris_node(&self, node: &Value, shortcode: &str, index: usize) -> Option<MediaItem> {
+        let id = node
+            .get("pk")
+            .or_else(|| node.get("id"))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else if let Some(n) = v.as_i64() {
+                    Some(n.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| format!("{}_{}", shortcode, index));
+
+        let orig_w = node.get("original_width").and_then(|v| v.as_u64()).map(|n| n as u32);
+        let orig_h = node.get("original_height").and_then(|v| v.as_u64()).map(|n| n as u32);
+
+        let display_uri = node
+            .get("display_uri")
+            .or_else(|| node.get("display_url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let video_versions = node.get("video_versions").and_then(|v| v.as_array());
+        let is_video = node.get("is_video").and_then(|v| v.as_bool()).unwrap_or(false)
+            || video_versions.map_or(false, |v| !v.is_empty())
+            || node
+                .get("__typename")
+                .and_then(|v| v.as_str())
+                .map_or(false, |t| t.contains("Video"));
+
+        if is_video {
+            let best_video = video_versions.and_then(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let url = v.get("url").and_then(|u| u.as_str())?;
+                        let width = v.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
+                        let height = v.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+                        Some((url.to_string(), width * height, width as u32, height as u32))
+                    })
+                    .filter(|(_, area, _, _)| *area > 0)
+                    .max_by_key(|(_, area, _, _)| *area)
+                    .or_else(|| {
+                        arr.first()
+                            .and_then(|v| v.get("url").and_then(|u| u.as_str()))
+                            .map(|u| (u.to_string(), 0, 0, 0))
+                    })
+            });
+
+            if let Some((v_url, _, vw, vh)) = best_video {
+                let thumb = display_uri.clone().unwrap_or_else(|| v_url.clone());
+                let width = if vw > 0 { Some(vw) } else { orig_w };
+                let height = if vh > 0 { Some(vh) } else { orig_h };
+                return Some(MediaItem {
+                    id,
+                    media_type: MediaType::Video,
+                    url: v_url,
+                    thumbnail_url: thumb,
+                    width,
+                    height,
+                });
+            }
+        }
+
+        let candidates = node.pointer("/image_versions2/candidates").and_then(|v| v.as_array());
+        let best_image = candidates.and_then(|arr| {
+            arr.iter()
+                .filter_map(|cand| {
+                    let url = cand.get("url").and_then(|u| u.as_str())?;
+                    let width = cand.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
+                    let height = cand.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+                    Some((url.to_string(), width * height, width as u32, height as u32))
+                })
+                .filter(|(_, area, _, _)| *area > 0)
+                .max_by_key(|(_, area, _, _)| *area)
+                .or_else(|| {
+                    arr.first()
+                        .and_then(|c| c.get("url").and_then(|u| u.as_str()))
+                        .map(|u| (u.to_string(), 0, 0, 0))
+                })
+        });
+
+        if let Some((i_url, _, iw, ih)) = best_image {
+            let thumb = display_uri.clone().unwrap_or_else(|| i_url.clone());
+            let width = if iw > 0 { Some(iw) } else { orig_w };
+            let height = if ih > 0 { Some(ih) } else { orig_h };
+            return Some(MediaItem {
+                id,
+                media_type: MediaType::Image,
+                url: i_url,
+                thumbnail_url: thumb,
+                width,
+                height,
+            });
+        }
+
+        if let Some(uri) = display_uri {
+            return Some(MediaItem {
+                id,
+                media_type: MediaType::Image,
+                url: uri.clone(),
+                thumbnail_url: uri,
+                width: orig_w,
+                height: orig_h,
+            });
+        }
+
+        None
+    }
+
+    fn parse_regex_candidates(&self, html: &str, shortcode: &str) -> Option<PostInfo> {
+        let cand_re = Regex::new(r#""candidates"\s*:\s*\[\s*\{\s*"url"\s*:\s*"([^"]+)""#).ok()?;
+        let mut urls = Vec::new();
+
+        for cap in cand_re.captures_iter(html) {
+            if let Some(m) = cap.get(1) {
+                let clean = m.as_str()
+                    .replace(r"\u0026", "&")
+                    .replace(r"\u0025", "%")
+                    .replace(r"\/", "/");
+                if !urls.contains(&clean) {
+                    urls.push(clean);
+                }
+            }
+        }
+
+        if urls.is_empty() {
+            return None;
+        }
+
+        let desc_re = Regex::new(r#"<meta\s+(?:property|name)=["'](?:og:description|description)["']\s+content=["']([^"']+)["']"#).ok()?;
+        let title_re = Regex::new(r#"<meta\s+(?:property|name)=["']og:title["']\s+content=["']([^"']+)["']"#).ok()?;
+
+        let caption = desc_re.captures(html).and_then(|c| c.get(1)).map(|m| {
+            m.as_str()
+                .replace("&quot;", "\"")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+        });
+
+        let owner_username = title_re.captures(html).and_then(|c| c.get(1)).and_then(|m| {
+            let u_re = Regex::new(r#"@([a-zA-Z0-9_.]+)"#).ok()?;
+            u_re.captures(m.as_str()).and_then(|uc| uc.get(1)).map(|um| um.as_str().to_string())
+        });
+
+        let items = urls
+            .into_iter()
+            .enumerate()
+            .map(|(index, u)| MediaItem {
+                id: format!("{}_{}", shortcode, index + 1),
+                media_type: MediaType::Image,
+                thumbnail_url: u.clone(),
+                url: u,
+                width: None,
+                height: None,
+            })
+            .collect();
+
+        Some(PostInfo {
+            shortcode: shortcode.to_string(),
+            caption,
+            owner_username,
+            owner_full_name: None,
+            items,
+        })
+    }
+
+    fn find_key_recursive<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+        match value {
+            Value::Object(map) => {
+                if let Some(v) = map.get(key) {
+                    return Some(v);
+                }
+                for (_, v) in map {
+                    if let Some(found) = Self::find_key_recursive(v, key) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    if let Some(found) = Self::find_key_recursive(v, key) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     async fn fetch_via_crawler(&self, shortcode: &str, cookie: Option<&str>) -> Result<PostInfo, String> {
@@ -210,7 +615,7 @@ impl Extractor {
         headers.insert(
             USER_AGENT,
             HeaderValue::from_static(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
             ),
         );
         headers.insert(
@@ -262,9 +667,8 @@ impl Extractor {
     }
 
     fn parse_graphql_json(&self, json: &Value, fallback_shortcode: &str) -> Result<PostInfo, String> {
-        let media = json
-            .pointer("/data/xdt_shortcode_media")
-            .or_else(|| json.pointer("/data/shortcode_media"))
+        let media = Self::find_key_recursive(json, "xdt_shortcode_media")
+            .or_else(|| Self::find_key_recursive(json, "shortcode_media"))
             .ok_or_else(|| "No media object found in GraphQL response".to_string())?;
 
         let shortcode = media
@@ -370,7 +774,7 @@ impl Extractor {
         headers.insert(
             USER_AGENT,
             HeaderValue::from_static(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
             ),
         );
         headers.insert(REFERER, HeaderValue::from_static("https://www.instagram.com/"));
@@ -488,7 +892,7 @@ impl Extractor {
         headers.insert(
             USER_AGENT,
             HeaderValue::from_static(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
             ),
         );
         headers.insert(
@@ -529,3 +933,4 @@ impl Extractor {
         Err("Failed to parse info API response".to_string())
     }
 }
+
